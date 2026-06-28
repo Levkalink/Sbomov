@@ -17,6 +17,19 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, B
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+# BDU модули
+sys.path.insert(0, str(Path(__file__).parent))
+try:
+    from bdu_parser  import build_db, db_exists, get_meta, DB_PATH as BDU_DB
+    from bdu_matcher import scan_sbom, get_stats, match_component
+    BDU_AVAILABLE = True
+except ImportError as _e:
+    BDU_AVAILABLE = False
+    BDU_DB = Path(__file__).parent / "bdu.db"
+
+# Задания BDU (импорт и сканирование)
+BDU_JOBS: dict[str, dict] = {}
+
 # ─── Пути ───────────────────────────────────────────────────────────────────
 BASE_DIR    = Path(__file__).parent
 CHECKER_DIR = BASE_DIR.parent / "sbom-checker-master"
@@ -608,3 +621,147 @@ async def list_jobs():
          for j in JOBS.values()],
         key=lambda x: x["created_at"], reverse=True
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BDU API
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _bdu_import_task(task_id: str, zip_path: str):
+    """Фоновый импорт BDU XML в SQLite."""
+    BDU_JOBS[task_id]["status"] = "running"
+    BDU_JOBS[task_id]["logs"] = []
+
+    def progress(n):
+        BDU_JOBS[task_id]["logs"].append(f"  Загружено: {n:,} записей...")
+        BDU_JOBS[task_id]["progress"] = n
+
+    try:
+        BDU_JOBS[task_id]["logs"].append(f"Начало импорта: {zip_path}")
+        count = build_db(zip_path, db_path=BDU_DB, progress_cb=progress)
+        BDU_JOBS[task_id]["status"] = "done"
+        BDU_JOBS[task_id]["count"] = count
+        BDU_JOBS[task_id]["logs"].append(f"✓ Импорт завершён: {count:,} уязвимостей")
+    except Exception as e:
+        BDU_JOBS[task_id]["status"] = "error"
+        BDU_JOBS[task_id]["logs"].append(f"✗ Ошибка: {e}")
+        import traceback
+        BDU_JOBS[task_id]["logs"].append(traceback.format_exc())
+
+
+@app.get("/api/bdu/status")
+async def bdu_status():
+    """Статус базы данных BDU."""
+    if not BDU_AVAILABLE:
+        return {"available": False, "error": "bdu_parser модуль недоступен"}
+    stats = get_stats(BDU_DB)
+    meta  = get_meta(BDU_DB)
+    return {"available": True, "db_exists": db_exists(BDU_DB),
+            "stats": stats, "meta": meta}
+
+
+@app.post("/api/bdu/import")
+async def bdu_import(background_tasks: BackgroundTasks, params: dict = Body(...)):
+    """Запускает импорт BDU XML/ZIP в SQLite."""
+    if not BDU_AVAILABLE:
+        raise HTTPException(503, "bdu_parser недоступен")
+    zip_path = params.get("zip_path", "/root/sbomsauto/vulxml.zip")
+    if not Path(zip_path).exists():
+        raise HTTPException(404, f"Файл не найден: {zip_path}")
+
+    task_id = uuid.uuid4().hex[:10]
+    BDU_JOBS[task_id] = {
+        "id": task_id, "status": "pending",
+        "logs": [], "progress": 0, "count": 0,
+        "created_at": time.time(),
+    }
+    background_tasks.add_task(_bdu_import_task, task_id, zip_path)
+    return {"task_id": task_id}
+
+
+@app.get("/api/bdu/import/{task_id}/stream")
+async def bdu_import_stream(task_id: str):
+    """SSE-стрим прогресса импорта BDU."""
+    if task_id not in BDU_JOBS:
+        raise HTTPException(404)
+
+    async def gen():
+        sent = 0
+        while True:
+            j = BDU_JOBS.get(task_id, {})
+            logs = j.get("logs", [])
+            while sent < len(logs):
+                yield f"data: {json.dumps(logs[sent])}\n\n"
+                sent += 1
+            if j.get("status") in ("done", "error") and sent >= len(logs):
+                yield f"data: __DONE__{json.dumps({'count': j.get('count', 0), 'status': j.get('status')})}\n\n"
+                break
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/bdu/scan")
+async def bdu_scan(background_tasks: BackgroundTasks, params: dict = Body(...)):
+    """Сканирует SBOM-файл против базы BDU."""
+    if not BDU_AVAILABLE:
+        raise HTTPException(503, "bdu_matcher недоступен")
+    if not db_exists(BDU_DB):
+        raise HTTPException(409, "База BDU не загружена. Сначала выполните импорт.")
+
+    # Получаем SBOM файл — либо из job, либо прямой путь
+    sbom_path: Optional[Path] = None
+    job_id = params.get("job_id")
+    if job_id and job_id in JOBS:
+        final_sbom = JOBS[job_id].get("final_sbom")
+        if final_sbom:
+            sbom_path = Path(JOBS[job_id]["output_dir"]) / final_sbom
+    if not sbom_path:
+        direct = params.get("sbom_path", "")
+        if direct:
+            sbom_path = Path(direct)
+    if not sbom_path or not sbom_path.exists():
+        raise HTTPException(404, "SBOM файл не найден")
+
+    task_id = uuid.uuid4().hex[:10]
+    BDU_JOBS[task_id] = {
+        "id": task_id, "status": "running",
+        "logs": [f"Сканирование: {sbom_path.name}"],
+        "result": None, "created_at": time.time(),
+    }
+
+    def _do_scan():
+        try:
+            result = scan_sbom(sbom_path, db_path=BDU_DB)
+            BDU_JOBS[task_id]["result"] = result
+            BDU_JOBS[task_id]["status"] = "done"
+            s = result["stats"]
+            BDU_JOBS[task_id]["logs"].append(
+                f"✓ Готово: {s['affected_components']} компонентов с уязвимостями, "
+                f"{s['total_vulns']} всего (critical={s['critical']}, high={s['high']})"
+            )
+        except Exception as e:
+            BDU_JOBS[task_id]["status"] = "error"
+            BDU_JOBS[task_id]["logs"].append(f"✗ Ошибка: {e}")
+
+    background_tasks.add_task(_do_scan)
+    return {"task_id": task_id}
+
+
+@app.get("/api/bdu/scan/{task_id}")
+async def bdu_scan_result(task_id: str):
+    """Возвращает результат BDU-сканирования."""
+    if task_id not in BDU_JOBS:
+        raise HTTPException(404)
+    j = BDU_JOBS[task_id]
+    return {"status": j["status"], "logs": j.get("logs", []), "result": j.get("result")}
+
+
+@app.get("/api/bdu/search")
+async def bdu_search(q: str, limit: int = 10):
+    """Поиск уязвимостей по имени компонента."""
+    if not BDU_AVAILABLE or not db_exists(BDU_DB):
+        raise HTTPException(409, "База BDU не загружена")
+    results = match_component(name=q, limit=limit, db_path=BDU_DB)
+    return {"results": results}

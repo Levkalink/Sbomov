@@ -232,6 +232,7 @@ tbody tr:hover td { background: var(--bg3); }
     <button class="tab active" onclick="switchTab('generate')">⚙️ Генерация</button>
     <button class="tab" onclick="switchTab('validate')">✅ Проверка</button>
     <button class="tab" onclick="switchTab('results')">📊 Результаты</button>
+    <button class="tab" onclick="switchTab('bdu')">🛡️ BDU ФСТЭК</button>
     <button class="tab" onclick="switchTab('history')">🕑 История</button>
   </div>
 
@@ -484,6 +485,54 @@ tbody tr:hover td { background: var(--bg3); }
         </table>
       </div>
     </div>
+  </div>
+
+  <!-- ── TAB: BDU ФСТЭК ── -->
+  <div class="tab-content" id="tab-bdu">
+
+    <!-- Status banner -->
+    <div id="bduStatusBanner" class="quality-panel" style="margin-bottom:16px">
+      <div class="quality-header">
+        <span class="quality-title">🛡️ База данных уязвимостей ФСТЭК (БДУ)</span>
+        <button class="btn btn-secondary btn-sm" onclick="bduLoadStatus()" style="margin-left:12px">🔄 Обновить статус</button>
+      </div>
+      <div id="bduStatusBody" style="margin-top:8px;color:#aaa">Загрузка статуса…</div>
+    </div>
+
+    <!-- Import section -->
+    <div class="section-title">Импорт базы уязвимостей</div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+      <input id="bduXmlPath" class="input-field" style="flex:1;min-width:280px"
+             value="/root/sbomsauto/vulxml.zip"
+             placeholder="Путь к vulxml.zip или vulxml.xml на сервере">
+      <button class="btn btn-primary" onclick="bduStartImport()">⬇️ Импортировать</button>
+    </div>
+    <div id="bduImportLog" class="log-box" style="display:none;height:150px;font-size:12px"></div>
+
+    <hr style="border-color:#333;margin:20px 0">
+
+    <!-- Scan section -->
+    <div class="section-title">Сканирование SBOM на уязвимости</div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+      <input id="bduSbomPath" class="input-field" style="flex:1;min-width:280px"
+             placeholder="Путь к SBOM JSON (или оставьте пустым для текущего задания)">
+      <button class="btn btn-primary" onclick="bduStartScan()">🔍 Сканировать</button>
+    </div>
+    <div id="bduScanStatus" style="font-size:13px;color:#aaa;margin-bottom:12px"></div>
+    <div id="bduScanResults"></div>
+
+    <hr style="border-color:#333;margin:20px 0">
+
+    <!-- Manual search -->
+    <div class="section-title">Поиск уязвимостей по компоненту</div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+      <input id="bduSearchQ" class="input-field" style="flex:1;min-width:280px"
+             placeholder="Имя компонента (напр. openssl, libssl, curl)…"
+             onkeydown="if(event.key==='Enter') bduSearch()">
+      <button class="btn btn-secondary" onclick="bduSearch()">🔎 Найти</button>
+    </div>
+    <div id="bduSearchResults"></div>
+
   </div>
 
   <!-- ── TAB: History ── -->
@@ -917,6 +966,243 @@ function updatePreview() {
   if (!p) { el.textContent = ''; return; }
   el.textContent = '…';
 }
+
+// ══════════════════════════════════════════════════════════════
+// BDU ФСТЭК
+// ══════════════════════════════════════════════════════════════
+
+const SEV_COLOR = { critical: '#e53935', high: '#f57c00', medium: '#f9a825', low: '#43a047', unknown: '#78909c' };
+const SEV_LABEL = { critical: 'Критическая', high: 'Высокая', medium: 'Средняя', low: 'Низкая', unknown: 'Неизвестно' };
+
+async function bduLoadStatus() {
+  const body = document.getElementById('bduStatusBody');
+  body.innerHTML = '<span style="color:#aaa">Загрузка…</span>';
+  try {
+    const r = await fetch('/api/bdu/status');
+    const s = await r.json();
+    if (!s.available) {
+      body.innerHTML = '<span style="color:#f57c00">⚠️ Модуль BDU недоступен (bdu_parser.py не найден)</span>';
+      return;
+    }
+    if (!s.loaded) {
+      body.innerHTML = '<span style="color:#f57c00">⚠️ База БДУ не загружена. Выполните импорт ниже.</span>';
+      return;
+    }
+    const sev = s.by_severity || {};
+    body.innerHTML = `
+      <div style="display:flex;gap:24px;flex-wrap:wrap;margin-top:4px">
+        <span style="color:#4caf50">✅ Загружена</span>
+        <span>Всего записей: <b style="color:#e0e0e0">${(s.total||0).toLocaleString('ru')}</b></span>
+        <span style="color:${SEV_COLOR.critical}">Критических: <b>${(sev.critical||0).toLocaleString('ru')}</b></span>
+        <span style="color:${SEV_COLOR.high}">Высоких: <b>${(sev.high||0).toLocaleString('ru')}</b></span>
+        <span style="color:${SEV_COLOR.medium}">Средних: <b>${(sev.medium||0).toLocaleString('ru')}</b></span>
+        <span style="color:${SEV_COLOR.low}">Низких: <b>${(sev.low||0).toLocaleString('ru')}</b></span>
+        <span>С эксплойтом: <b style="color:#e53935">${(s.with_exploit||0).toLocaleString('ru')}</b></span>
+      </div>
+      <div style="color:#aaa;font-size:12px;margin-top:6px">
+        Импортировано: ${s.imported_at ? new Date(s.imported_at).toLocaleString('ru') : '—'}
+        &nbsp;|&nbsp; Источник: ${s.source || '—'}
+      </div>`;
+  } catch(e) {
+    body.innerHTML = `<span style="color:#e53935">Ошибка: ${e}</span>`;
+  }
+}
+
+async function bduStartImport() {
+  const path = document.getElementById('bduXmlPath').value.trim();
+  if (!path) return alert('Укажите путь к файлу vulxml.zip или vulxml.xml');
+  const logEl = document.getElementById('bduImportLog');
+  logEl.style.display = 'block';
+  logEl.innerHTML = '';
+
+  const appendLog = (line, color) => {
+    const d = document.createElement('div');
+    d.className = 'log-line';
+    if (color) d.style.color = color;
+    d.textContent = line;
+    logEl.appendChild(d);
+    logEl.scrollTop = logEl.scrollHeight;
+  };
+
+  appendLog('Запуск импорта…', '#aaa');
+  let res;
+  try {
+    res = await fetch('/api/bdu/import', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path }),
+    });
+    if (!res.ok) { const t = await res.text(); throw new Error(t); }
+  } catch(e) {
+    appendLog('Ошибка запуска: ' + e, '#e53935');
+    return;
+  }
+
+  const { task_id } = await res.json();
+  const es = new EventSource(`/api/bdu/import/${task_id}/stream`);
+  es.onmessage = ev => {
+    const d = JSON.parse(ev.data);
+    if (d.type === 'progress') appendLog(d.message, '#aaa');
+    else if (d.type === 'done') {
+      appendLog(`✅ Импорт завершён: ${d.count.toLocaleString('ru')} уязвимостей`, '#4caf50');
+      es.close();
+      bduLoadStatus();
+    } else if (d.type === 'error') {
+      appendLog('❌ ' + d.message, '#e53935');
+      es.close();
+    }
+  };
+  es.onerror = () => { appendLog('Соединение прервано', '#f57c00'); es.close(); };
+}
+
+async function bduStartScan() {
+  const pathEl = document.getElementById('bduSbomPath');
+  const statusEl = document.getElementById('bduScanStatus');
+  const resultsEl = document.getElementById('bduScanResults');
+
+  let sbom_path = pathEl.value.trim();
+  if (!sbom_path && currentJobId) {
+    statusEl.textContent = `Сканирование задания ${currentJobId}…`;
+  } else if (!sbom_path) {
+    statusEl.textContent = '⚠️ Укажите путь к SBOM или запустите задание на вкладке Генерация';
+    return;
+  }
+
+  resultsEl.innerHTML = '<div style="color:#aaa">Сканирование…</div>';
+  statusEl.textContent = '';
+
+  try {
+    const body = sbom_path ? { sbom_path } : { job_id: currentJobId };
+    const r = await fetch('/api/bdu/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) { const t = await r.text(); throw new Error(t); }
+    const { task_id } = await r.json();
+
+    // poll for result
+    let data;
+    for (let i = 0; i < 300; i++) {
+      await new Promise(res => setTimeout(res, 1000));
+      const pr = await fetch(`/api/bdu/scan/${task_id}`);
+      data = await pr.json();
+      if (data.status === 'done' || data.status === 'error') break;
+      statusEl.textContent = `Сканирование… проверено компонентов: ${data.progress || 0}`;
+    }
+
+    if (data.status === 'error') {
+      resultsEl.innerHTML = `<div style="color:#e53935">❌ ${data.error}</div>`;
+      return;
+    }
+    bduRenderScanResults(data.result, resultsEl);
+  } catch(e) {
+    resultsEl.innerHTML = `<div style="color:#e53935">Ошибка: ${e}</div>`;
+  }
+}
+
+function bduRenderScanResults(result, el) {
+  if (!result) { el.innerHTML = '<div style="color:#aaa">Нет данных</div>'; return; }
+  const { stats, components, total_components_scanned } = result;
+
+  let html = `
+    <div class="stat-grid" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px">
+      <div class="stat-card"><div class="stat-value" style="color:${SEV_COLOR.critical}">${stats.critical||0}</div><div class="stat-label">Критических</div></div>
+      <div class="stat-card"><div class="stat-value" style="color:${SEV_COLOR.high}">${stats.high||0}</div><div class="stat-label">Высоких</div></div>
+      <div class="stat-card"><div class="stat-value" style="color:${SEV_COLOR.medium}">${stats.medium||0}</div><div class="stat-label">Средних</div></div>
+      <div class="stat-card"><div class="stat-value" style="color:#e53935">${stats.with_exploit||0}</div><div class="stat-label">С эксплойтом</div></div>
+    </div>
+    <div style="color:#aaa;font-size:13px;margin-bottom:12px">
+      Проверено компонентов: <b>${total_components_scanned||0}</b> &nbsp;|&nbsp;
+      Уязвимых: <b style="color:#f57c00">${stats.affected_components||0}</b> &nbsp;|&nbsp;
+      Уязвимостей найдено: <b style="color:#e53935">${stats.total_vulns||0}</b>
+    </div>`;
+
+  if (!components || components.length === 0) {
+    html += '<div style="color:#4caf50;padding:12px">✅ Уязвимостей не обнаружено</div>';
+  } else {
+    for (const { component, vulnerabilities } of components) {
+      const topSev = vulnerabilities[0]?.severity || 'unknown';
+      html += `
+        <details style="margin-bottom:10px;border:1px solid #333;border-radius:6px;overflow:hidden">
+          <summary style="padding:10px 14px;background:#1e1e2e;cursor:pointer;display:flex;gap:12px;align-items:center">
+            <span style="background:${SEV_COLOR[topSev]};color:#000;font-size:11px;padding:2px 6px;border-radius:4px;font-weight:700">${SEV_LABEL[topSev]}</span>
+            <b style="color:#e0e0e0">${component.name}</b>
+            <span style="color:#aaa">${component.version || ''}</span>
+            <span style="color:#78909c;font-size:12px">${component.purl || ''}</span>
+            <span style="margin-left:auto;color:#aaa;font-size:12px">${vulnerabilities.length} уязв.</span>
+          </summary>
+          <div style="padding:10px 14px;background:#12121c">
+            ${vulnerabilities.map(v => bduVulnRow(v)).join('')}
+          </div>
+        </details>`;
+    }
+  }
+
+  el.innerHTML = html;
+}
+
+function bduVulnRow(v) {
+  const exploitBadge = v.public_exploit
+    ? '<span style="background:#e53935;color:#fff;font-size:11px;padding:1px 5px;border-radius:3px;margin-left:6px">🔴 публичный эксплойт</span>'
+    : v.has_exploit
+      ? '<span style="background:#f57c00;color:#fff;font-size:11px;padding:1px 5px;border-radius:3px;margin-left:6px">⚠️ эксплойт</span>'
+      : '';
+  const cveLinks = (v.cve_ids || []).map(c =>
+    `<a href="https://nvd.nist.gov/vuln/detail/${c}" target="_blank" style="color:#7986cb;margin-right:4px">${c}</a>`
+  ).join('');
+
+  return `
+    <div style="border-bottom:1px solid #222;padding:8px 0;last-child:border:none">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <span style="background:${SEV_COLOR[v.severity]};color:#000;font-size:11px;padding:1px 6px;border-radius:3px;font-weight:700">${v.cvss_score ? v.cvss_score.toFixed(1) : SEV_LABEL[v.severity]}</span>
+        <a href="${v.bdu_url}" target="_blank" style="color:#90caf9;font-weight:600">${v.bdu_id}</a>
+        ${exploitBadge}
+        <span style="color:#aaa;font-size:12px">${cveLinks}</span>
+      </div>
+      <div style="color:#ccc;font-size:13px;margin-top:4px">${v.name || ''}</div>
+      ${v.description ? `<div style="color:#78909c;font-size:12px;margin-top:2px">${v.description.slice(0,200)}${v.description.length>200?'…':''}</div>` : ''}
+      ${v.solution ? `<div style="color:#81c784;font-size:12px;margin-top:4px">💡 ${v.solution.slice(0,200)}${v.solution.length>200?'…':''}</div>` : ''}
+    </div>`;
+}
+
+async function bduSearch() {
+  const q = document.getElementById('bduSearchQ').value.trim();
+  if (!q) return;
+  const el = document.getElementById('bduSearchResults');
+  el.innerHTML = '<div style="color:#aaa">Поиск…</div>';
+  try {
+    const r = await fetch(`/api/bdu/search?q=${encodeURIComponent(q)}`);
+    if (!r.ok) throw new Error(await r.text());
+    const data = await r.json();
+    if (!data.results || data.results.length === 0) {
+      el.innerHTML = '<div style="color:#4caf50">Уязвимостей не найдено</div>';
+      return;
+    }
+    const fakeResult = {
+      stats: { critical:0, high:0, medium:0, with_exploit:0, total_vulns: data.results.length, affected_components:1 },
+      components: [{ component: { name: q, version:'', purl:'' }, vulnerabilities: data.results }],
+      total_components_scanned: 1,
+    };
+    // update severity stats
+    data.results.forEach(v => {
+      fakeResult.stats[v.severity] = (fakeResult.stats[v.severity]||0)+1;
+      if (v.has_exploit) fakeResult.stats.with_exploit++;
+    });
+    bduRenderScanResults(fakeResult, el);
+  } catch(e) {
+    el.innerHTML = `<div style="color:#e53935">Ошибка: ${e}</div>`;
+  }
+}
+
+// Auto-load BDU status when switching to BDU tab
+(function(){
+  const orig = window.switchTab;
+  window.switchTab = function(name) {
+    orig(name);
+    if (name === 'bdu') bduLoadStatus();
+  };
+})();
 
 // ── Init ─────────────────────────────────────────────────
 window.onload = () => {
