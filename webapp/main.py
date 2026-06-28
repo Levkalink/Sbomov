@@ -537,16 +537,15 @@ def _run_cdxgen_multi(job_id: str, project_path: str, langs: list[dict],
 
     raw_out = out_dir / "sbom-cdxgen-raw.json"
 
-    profile = "appsec"  # appsec profile auto-enables --deep + evidence
     extra_flags = list(extra)
     extra_flags += ["--include-formulation"]  # CISA 2025: Generation Context
     extra_flags += ["--recurse"]              # recurse into subdirs
-    # --deep is already enabled by appsec profile for C/C++
-    if has_c and "appsec" not in profile:
-        extra_flags += ["--deep"]
+    if has_c:
+        extra_flags += ["--deep"]             # binary analysis for C/C++
 
     lang_names = ", ".join(f"{l.get('icon','')} {l['name']}" for l in langs)
-    _log(job_id, f"\n  ▸ cdxgen --type {' --type '.join(types)} --profile {profile} --include-formulation")
+    _log(job_id, f"\n  ▸ cdxgen --type {' --type '.join(types)} --include-formulation"
+         + (" --deep" if has_c else ""))
     _log(job_id, f"    Языки: {lang_names}")
 
     rc = _run(job_id, [
@@ -556,7 +555,6 @@ def _run_cdxgen_multi(job_id: str, project_path: str, langs: list[dict],
         "--output",           str(raw_out),
         "--project-name",     proj_name,
         "--project-version",  proj_ver,
-        "--profile",          profile,
         *filters, *extra_flags,
         project_path,
     ], env={**os.environ})
@@ -1124,6 +1122,25 @@ async def bdu_scan(background_tasks: BackgroundTasks, params: dict = Body(...)):
         try:
             result = scan_sbom(sbom_path, db_path=BDU_DB)
 
+            # ── EPSS + KEV enrichment ─────────────────────────────────────────
+            if KEV_AVAILABLE:
+                try:
+                    all_cves: list[str] = []
+                    for ce in result.get("components", []):
+                        for v in ce.get("vulnerabilities", []):
+                            all_cves.extend(v.get("cve_ids", []))
+                    if all_cves:
+                        epss_data = enrich_cve_list(all_cves)
+                        kev_hits  = check_cve_list(all_cves)
+                        result["epss_summary"] = epss_data
+                        result["kev_hits"]     = len(kev_hits)
+                        result["kev_cves"]     = list(kev_hits.keys())
+                        BDU_JOBS[task_id]["logs"].append(
+                            f"  ✓ EPSS: max={epss_data.get('max_epss')}, "
+                            f"KEV совпадений: {len(kev_hits)}"
+                        )
+                except Exception as ee:
+                    BDU_JOBS[task_id]["logs"].append(f"  ⚠ EPSS/KEV: {ee}")
 
             BDU_JOBS[task_id]["result"] = result
             BDU_JOBS[task_id]["status"] = "done"
@@ -1370,6 +1387,39 @@ async def tools_status():
         "jq":           bool(sh.which("jq")),
     }
     return {"tools": tools, "bdu_available": BDU_AVAILABLE,
-            "importers_ok": IMPORTERS_OK}
+            "importers_ok": IMPORTERS_OK, "kev_available": KEV_AVAILABLE}
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# KEV / EPSS
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/kev/status")
+async def kev_status():
+    if not KEV_AVAILABLE:
+        return {"available": False}
+    return {"available": True, "stats": get_kev_stats()}
+
+
+@app.post("/api/kev/update")
+async def kev_update(background_tasks: BackgroundTasks):
+    if not KEV_AVAILABLE:
+        raise HTTPException(503, "kev_checker недоступен")
+    background_tasks.add_task(update_kev)
+    return {"message": "Обновление KEV запущено"}
+
+
+@app.post("/api/kev/check")
+async def kev_check_endpoint(params: dict = Body(...)):
+    if not KEV_AVAILABLE:
+        raise HTTPException(503)
+    hits = check_cve_list(params.get("cve_ids", []))
+    return {"in_kev": len(hits), "details": hits}
+
+
+@app.post("/api/epss")
+async def epss_lookup(params: dict = Body(...)):
+    if not KEV_AVAILABLE:
+        raise HTTPException(503)
+    return enrich_cve_list(params.get("cve_ids", []))
 
