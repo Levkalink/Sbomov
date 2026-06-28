@@ -1,0 +1,136 @@
+# GitHub Actions workflow для автоматической генерации SBOM
+# Файл: .github/workflows/sbom.yml
+
+name: SBOM Generation
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  schedule:
+    - cron: '0 2 * * 1'  # Каждый понедельник в 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      check_vcs:
+        description: 'Проверять VCS-ссылки (медленно)'
+        required: false
+        default: 'false'
+
+jobs:
+  sbom:
+    name: Generate & Validate SBOM
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      security-events: write  # Для загрузки в GitHub Security
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Нужен для git describe (версия из тега)
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq curl git jq python3 python3-pip python3-venv
+
+      - name: Install cdxgen (OWASP CycloneDX)
+        run: npm install -g @cyclonedx/cdxgen
+
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sudo sh -s -- -b /usr/local/bin
+
+      - name: Install CycloneDX CLI
+        run: |
+          curl -sSfL \
+            "https://github.com/CycloneDX/cyclonedx-cli/releases/download/v0.27.1/cyclonedx-linux-x64" \
+            -o /usr/local/bin/cyclonedx
+          sudo chmod +x /usr/local/bin/cyclonedx
+
+      - name: Install cyclonedx-conan
+        run: pip3 install --quiet cyclonedx-conan
+
+      - name: Install sbom-checker (ИСПРАН)
+        run: |
+          git clone --quiet \
+            https://gitlab.community.ispras.ru/sdl-tools/sbom-checker.git \
+            /opt/sbom-checker 2>/dev/null || true
+          if [ -d /opt/sbom-checker ]; then
+            python3 -m venv /opt/sbom-checker/venv
+            /opt/sbom-checker/venv/bin/pip install --quiet \
+              -r /opt/sbom-checker/requirements.txt
+            printf '#!/bin/bash\nexec "/opt/sbom-checker/venv/bin/python3" "/opt/sbom-checker/sbom-checker.py" "$@"\n' \
+              | sudo tee /usr/local/bin/sbom-checker > /dev/null
+            printf '#!/bin/bash\nexec "/opt/sbom-checker/venv/bin/python3" "/opt/sbom-checker/sbom-updater.py" "$@"\n' \
+              | sudo tee /usr/local/bin/sbom-updater > /dev/null
+            sudo chmod +x /usr/local/bin/sbom-checker /usr/local/bin/sbom-updater
+            echo "sbom-checker установлен"
+          else
+            echo "::warning::sbom-checker недоступен (gitlab.community.ispras.ru)"
+          fi
+
+      - name: Clone sbomsauto scripts
+        run: |
+          # Если sbomsauto — отдельный репозиторий, клонируем его
+          # Если скрипты в текущем репо — этот шаг не нужен
+          git clone --quiet https://github.com/your-org/sbomsauto.git /opt/sbomsauto || true
+
+      - name: Generate SBOM
+        env:
+          SBOM_PROJECT_NAME: ${{ github.event.repository.name }}
+          SBOM_VERSION: ${{ github.ref_name }}
+          SBOM_OUTPUT_DIR: ${{ github.workspace }}/sbom-output
+          SBOM_SPEC_VERSION: '1.6'
+        run: |
+          bash /opt/sbomsauto/scripts/generate_sbom.sh "${{ github.workspace }}"
+
+      - name: Validate & Enrich SBOM (sbom-checker ИСПРАН)
+        env:
+          SBOM_APP_NAME: ${{ github.event.repository.name }}
+          SBOM_APP_VERSION: ${{ github.ref_name }}
+          SBOM_MANUFACTURER: ${{ github.repository_owner }}
+          SBOM_FORMAT: oss
+          SBOM_CHECK_VCS: ${{ inputs.check_vcs || 'false' }}
+          SBOM_MAX_ERRORS: '0'
+        run: |
+          SBOM_FILE=$(find sbom-output -name "sbom-*.json" \
+            ! -name "*filtered*" ! -name "*enriched*" | head -1)
+          [ -z "${SBOM_FILE}" ] && \
+            SBOM_FILE=$(find sbom-output -name "sbom-*-filtered.json" | head -1)
+          bash /opt/sbomsauto/scripts/check_and_enrich.sh "${SBOM_FILE}" || true
+
+      - name: Upload SBOM to GitHub Security (SPDX/CycloneDX)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.event.repository.name }}-${{ github.sha }}
+          path: |
+            sbom-output/*.json
+          retention-days: 90
+
+      - name: Upload to GitHub Dependency Submission
+        uses: advanced-security/sbom-report-action@v1
+        with:
+          sbom-report: sbom-output/sbom-${{ github.event.repository.name }}-*.json
+        continue-on-error: true
+
+      - name: Publish to Dependency Track
+        if: github.ref_type == 'tag' && env.DTRACK_URL != ''
+        env:
+          DTRACK_URL: ${{ secrets.DTRACK_URL }}
+          DTRACK_API_KEY: ${{ secrets.DTRACK_API_KEY }}
+        run: |
+          SBOM_FILE=$(find sbom-output -name "*-enriched.json" | head -1)
+          BOM_B64=$(base64 -w 0 "${SBOM_FILE}")
+          curl -sf \
+            -H "X-Api-Key: ${DTRACK_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"projectName\":\"${{ github.event.repository.name }}\",\"projectVersion\":\"${{ github.ref_name }}\",\"autoCreate\":true,\"bom\":\"${BOM_B64}\"}" \
+            "${DTRACK_URL}/api/v1/bom"

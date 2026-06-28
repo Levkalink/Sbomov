@@ -1,0 +1,13 @@
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+aiofiles>=23.2.0
+python-multipart>=0.0.9
+# sbom-checker deps (из sbom-checker-master/requirements.txt)
+jsonschema>=4.22.0
+rfc3339-validator
+rfc3987
+odfpy
+requests
+platformdirs
+packageurl-python>=0.17.6
+referencing

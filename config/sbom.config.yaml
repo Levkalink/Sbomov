@@ -1,0 +1,123 @@
+# SBOM Automation Configuration
+# Конфигурация автоматизации генерации SBOM для C-проектов
+
+project:
+  name: "my-c-project"
+  version: "${GIT_TAG:-0.0.0}"
+
+output:
+  dir: "./sbom-output"
+  format: "cyclonedx"           # cyclonedx | spdx
+  spec_version: "1.6"           # CycloneDX version: 1.4 | 1.5 | 1.6
+  file_format: "json"           # json | xml
+  filename_prefix: "sbom"
+
+# Определение сканеров (порядок приоритета)
+scanners:
+  # 1. Conan (лучший для C: даёт точный lock-файл, минимум шума)
+  conan:
+    enabled: true
+    lock_file: "conan.lock"
+    conanfile: "conanfile.py"    # или conanfile.txt
+    include_dev: false
+
+  # 2. vcpkg (если используется Microsoft vcpkg)
+  vcpkg:
+    enabled: true
+    manifest: "vcpkg.json"
+    installed_dir: "vcpkg_installed"
+
+  # 3. cdxgen — мульти-язычный fallback (OWASP официальный)
+  cdxgen:
+    enabled: true
+    depth: 5                     # глубина рекурсии
+    include_formulation: false   # включать ли build metadata
+    required_only: false         # только прямые зависимости
+
+  # 4. Syft — бинарный анализ (последний резерв)
+  syft:
+    enabled: true
+    # Включаем только нужные каталогеры, исключаем шум от системных пакетов
+    catalogers:
+      enable:
+        - "binary-cataloger"
+        - "conan-cataloger"
+      disable:
+        - "dpkg-db-cataloger"   # ИСКЛЮЧИТЬ: системные Debian-пакеты (основной источник шума)
+        - "rpm-db-cataloger"    # ИСКЛЮЧИТЬ: системные RPM-пакеты
+        - "apk-db-cataloger"    # ИСКЛЮЧИТЬ: Alpine-пакеты
+
+# Фильтрация шума (применяется ко всем сканерам)
+noise_filter:
+  enabled: true
+
+  # Исключить пакеты по имени (glob-паттерны)
+  exclude_packages:
+    - "linux-*"
+    - "libc6"
+    - "libgcc*"
+    - "libstdc++*"
+    - "gcc-*"
+    - "binutils*"
+    - "coreutils"
+    - "base-files"
+    - "base-passwd"
+    - "bash"
+    - "debianutils"
+    - "diffutils"
+    - "dpkg"
+    - "e2fsprogs"
+    - "findutils"
+    - "grep"
+    - "gzip"
+    - "hostname"
+    - "init-system-helpers"
+    - "login"
+    - "mount"
+    - "ncurses-*"
+    - "passwd"
+    - "perl-*"
+    - "procps"
+    - "sed"
+    - "sensible-utils"
+    - "sysvinit-utils"
+    - "tar"
+    - "tzdata"
+    - "util-linux"
+    - "zlib1g"
+
+  # Исключить по PURL-namespace (типы пакетов)
+  exclude_purl_types:
+    - "deb"     # Debian системные пакеты — главный источник шума в C-проектах
+    - "rpm"     # RPM системные пакеты
+
+  # Исключить по PURL-namespace
+  exclude_namespaces:
+    - "debian"
+    - "ubuntu"
+    - "centos"
+    - "fedora"
+
+  # Исключить пути при сканировании
+  exclude_paths:
+    - "/usr/share/**"
+    - "/var/**"
+    - "/etc/**"
+    - "/boot/**"
+    - "/proc/**"
+    - "/sys/**"
+    - "/run/**"
+    - "/snap/**"
+
+# Обогащение данных
+enrichment:
+  add_licenses: true            # пытаться определить лицензии
+  add_hashes: true              # SHA-256 хэши компонентов
+  add_purl: true                # Package URL
+  add_cpe: true                 # Common Platform Enumeration
+
+# Валидация
+validation:
+  enabled: true
+  fail_on_invalid: false
+  min_components: 1

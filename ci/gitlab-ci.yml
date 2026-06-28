@@ -1,0 +1,131 @@
+# GitLab CI/CD Pipeline для автоматической генерации SBOM
+# Файл: .gitlab-ci.yml (скопируйте в корень вашего проекта)
+
+stages:
+  - build
+  - sbom-generate
+  - sbom-validate
+  - sbom-publish
+
+variables:
+  SBOM_FORMAT: "oss"                  # oss | container
+  SBOM_SPEC_VERSION: "1.6"
+  SBOM_CHECK_VCS: "false"             # true медленно, включать при необходимости
+  SBOM_MANUFACTURER: "${CI_SERVER_HOST}"
+  TOOLS_DIR: "${CI_PROJECT_DIR}/.sbomtools"
+
+# ─── Шаблон для установки инструментов ──────────────────────────────────────
+.sbom-setup: &sbom-setup
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq curl git jq nodejs npm python3 python3-pip python3-venv
+    - npm install -g @cyclonedx/cdxgen --silent
+    - curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+    - pip3 install --quiet cyclonedx-conan
+    # sbom-checker (ИСПРАН)
+    - |
+      git clone --quiet https://gitlab.community.ispras.ru/sdl-tools/sbom-checker.git \
+        "${TOOLS_DIR}/sbom-checker" 2>/dev/null || \
+        git -C "${TOOLS_DIR}/sbom-checker" pull --quiet 2>/dev/null || true
+    - |
+      if [ -d "${TOOLS_DIR}/sbom-checker" ]; then
+        python3 -m venv "${TOOLS_DIR}/sbom-checker/venv"
+        "${TOOLS_DIR}/sbom-checker/venv/bin/pip" install --quiet \
+          -r "${TOOLS_DIR}/sbom-checker/requirements.txt"
+        # Wrappers
+        printf '#!/bin/bash\nexec "%s/venv/bin/python3" "%s/sbom-checker.py" "$@"\n' \
+          "${TOOLS_DIR}/sbom-checker" "${TOOLS_DIR}/sbom-checker" > /usr/local/bin/sbom-checker
+        printf '#!/bin/bash\nexec "%s/venv/bin/python3" "%s/sbom-updater.py" "$@"\n' \
+          "${TOOLS_DIR}/sbom-checker" "${TOOLS_DIR}/sbom-checker" > /usr/local/bin/sbom-updater
+        chmod +x /usr/local/bin/sbom-checker /usr/local/bin/sbom-updater
+      fi
+
+# ─── Job: Генерация SBOM ─────────────────────────────────────────────────────
+sbom:generate:
+  stage: sbom-generate
+  image: ubuntu:22.04
+  <<: *sbom-setup
+  variables:
+    SBOM_PROJECT_NAME: "${CI_PROJECT_NAME}"
+    SBOM_VERSION: "${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}"
+    SBOM_OUTPUT_DIR: "${CI_PROJECT_DIR}/sbom-output"
+  script:
+    - |
+      bash sbomsauto/scripts/generate_sbom.sh "${CI_PROJECT_DIR}"
+  artifacts:
+    name: "sbom-${CI_PROJECT_NAME}-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - sbom-output/
+    expire_in: 30 days
+    reports:
+      # Публикация в GitLab Dependency Scanning
+      cyclonedx: sbom-output/sbom-${CI_PROJECT_NAME}-*.json
+  rules:
+    - if: '$CI_COMMIT_TAG'          # При тегах (релиз)
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'  # При push в main/master
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'        # По расписанию
+
+# ─── Job: Валидация SBOM через sbom-checker (ИСПРАН) ─────────────────────────
+sbom:validate:
+  stage: sbom-validate
+  image: ubuntu:22.04
+  <<: *sbom-setup
+  needs: ["sbom:generate"]
+  variables:
+    SBOM_APP_NAME: "${CI_PROJECT_NAME}"
+    SBOM_APP_VERSION: "${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}"
+    SBOM_MANUFACTURER: "${CI_SERVER_HOST}"
+    SBOM_FORMAT: "${SBOM_FORMAT}"
+    SBOM_CHECK_VCS: "${SBOM_CHECK_VCS}"
+    SBOM_MAX_ERRORS: "0"
+  script:
+    - |
+      SBOM_FILE=$(find sbom-output -name "sbom-${CI_PROJECT_NAME}-*.json" \
+        ! -name "*filtered*" ! -name "*enriched*" | head -1)
+      if [ -z "${SBOM_FILE}" ]; then
+        SBOM_FILE=$(find sbom-output -name "sbom-*-filtered.json" | head -1)
+      fi
+      echo "Валидируем: ${SBOM_FILE}"
+      bash sbomsauto/scripts/check_and_enrich.sh "${SBOM_FILE}"
+  artifacts:
+    name: "sbom-validated-${CI_PROJECT_NAME}-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - sbom-output/*-enriched.json
+    expire_in: 90 days
+  allow_failure: true   # Не блокируем pipeline при ошибках валидации
+
+# ─── Job: Публикация в Dependency Track (опционально) ────────────────────────
+sbom:publish:
+  stage: sbom-publish
+  image: curlimages/curl:latest
+  needs: ["sbom:validate"]
+  variables:
+    DTRACK_URL: "${DTRACK_URL}"        # Настроить в CI/CD Variables
+    DTRACK_API_KEY: "${DTRACK_API_KEY}" # Настроить в CI/CD Variables (masked)
+    DTRACK_PROJECT_NAME: "${CI_PROJECT_NAME}"
+    DTRACK_PROJECT_VERSION: "${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}"
+  script:
+    - |
+      SBOM_FILE=$(find sbom-output -name "*-enriched.json" | head -1)
+      [ -z "${SBOM_FILE}" ] && SBOM_FILE=$(find sbom-output -name "sbom-*.json" | head -1)
+      echo "Публикуем ${SBOM_FILE} в Dependency Track..."
+      BOM_B64=$(base64 -w 0 "${SBOM_FILE}")
+      curl -sf \
+        -H "X-Api-Key: ${DTRACK_API_KEY}" \
+        -H "Content-Type: application/json" \
+        -d "{
+          \"projectName\": \"${DTRACK_PROJECT_NAME}\",
+          \"projectVersion\": \"${DTRACK_PROJECT_VERSION}\",
+          \"autoCreate\": true,
+          \"bom\": \"${BOM_B64}\"
+        }" \
+        "${DTRACK_URL}/api/v1/bom" \
+        && echo "Успешно опубликован в Dependency Track" \
+        || echo "Ошибка публикации (проверьте DTRACK_URL и DTRACK_API_KEY)"
+  rules:
+    - if: '$CI_COMMIT_TAG && $DTRACK_URL && $DTRACK_API_KEY'
+      when: on_success
+  allow_failure: true
+
+# ─── Scheduled Pipeline (еженедельная проверка) ───────────────────────────────
+# Настройте в GitLab: Settings → CI/CD → Schedules → "Weekly SBOM"
+# Cron: 0 2 * * 1 (каждый понедельник в 02:00)
