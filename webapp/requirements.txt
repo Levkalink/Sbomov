@@ -11,3 +11,4 @@ requests
 platformdirs
 packageurl-python>=0.17.6
 referencing
+openpyxl>=3.1.0
