@@ -169,26 +169,81 @@ def match_component(
     return out[:limit]
 
 
+import math
+import datetime
+
+
+def calculate_priority_score(
+    cvss_score: float | None,
+    has_exploit: bool,
+    public_exploit: bool,
+    in_bdu: bool,
+    pub_date: str = "",
+) -> float:
+    """
+    Priority score 0-10 inspired by Red-Lycoris scoring formula.
+    Formula: cvss*0.30 + exploit_bonus*0.30 + bdu*0.15 + recency*0.15 + public_exploit*0.10
+    """
+    cvss = float(cvss_score or 0)
+
+    exploit_bonus = 0.0
+    if has_exploit:
+        exploit_bonus = 7.0
+    if public_exploit:
+        exploit_bonus = 10.0
+
+    bdu_val = 5.0 if in_bdu else 0.0
+
+    # Recency: newer vulns are more urgent
+    recency = 5.0
+    if pub_date:
+        try:
+            d = datetime.date.fromisoformat(pub_date[:10])
+            days_old = (datetime.date.today() - d).days
+            recency = 10.0 * math.exp(-days_old / 730.0)
+        except Exception:
+            pass
+
+    raw = (cvss * 0.30 + exploit_bonus * 0.30 + bdu_val * 0.15
+           + recency * 0.15 + (3.0 if public_exploit else 0.0) * 0.10)
+    max_raw = 10 * 0.30 + 10 * 0.30 + 5 * 0.15 + 10 * 0.15 + 3 * 0.10
+    score = (raw / max_raw) * 10.0
+    return round(min(10.0, max(0.0, score)), 2)
+
+
 def _row_to_dict(row: sqlite3.Row, match_type: str = "name", matched_by: str = "") -> dict:
     r = dict(row)
+    has_exploit    = bool(r.get("has_exploit"))
+    public_exploit = bool(r.get("public_exploit"))
+    pub_date       = r.get("pub_date", "") or ""
+    cvss_score     = r.get("cvss_score")
+    priority = calculate_priority_score(
+        cvss_score=cvss_score,
+        has_exploit=has_exploit,
+        public_exploit=public_exploit,
+        in_bdu=True,
+        pub_date=pub_date,
+    )
     return {
         "bdu_id":         r.get("bdu_id", ""),
         "name":           r.get("name", ""),
         "description":    (r.get("description") or "")[:500],
         "severity":       r.get("severity", "unknown"),
-        "cvss_score":     r.get("cvss_score"),
+        "cvss_score":     cvss_score,
         "cvss_vector":    r.get("cvss_vector", ""),
-        "has_exploit":    bool(r.get("has_exploit")),
-        "public_exploit": bool(r.get("public_exploit")),
+        "has_exploit":    has_exploit,
+        "public_exploit": public_exploit,
         "exploit_raw":    r.get("exploit_raw", ""),
         "fix_status":     r.get("fix_status", ""),
         "solution":       (r.get("solution") or "")[:400],
         "vul_class":      r.get("vul_class", ""),
-        "pub_date":       r.get("pub_date", ""),
+        "pub_date":       pub_date,
         "cve_ids":        r.get("cve_ids", "").split(",") if r.get("cve_ids") else [],
         "cwes":           r.get("cwes", "").split(",") if r.get("cwes") else [],
         "match_type":     match_type,
         "matched_by":     matched_by,
+        "priority_score": priority,
+        "status":         "open",  # triage status: open/confirmed/resolved/risk_accepted/false_positive
         "bdu_url":        f"https://bdu.fstec.ru/vul/{r.get('bdu_id','').replace('BDU:','')}",
     }
 

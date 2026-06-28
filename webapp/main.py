@@ -27,6 +27,21 @@ except ImportError:
     BDU_AVAILABLE = False
     BDU_DB = Path(__file__).parent / "bdu.db"
 
+try:
+    from vuln_importer import detect_and_parse as import_vuln_file
+    from vex_generator import embed_vex_into_sbom
+    from xlsx_exporter import export_bdu_scan
+    IMPORTERS_OK = True
+except ImportError:
+    IMPORTERS_OK = False
+
+try:  # EPSS + KEV enrichment (optional, requires network for EPSS)
+    from kev_checker import check_cve_list, get_stats as get_kev_stats, update_kev  # noqa: F401
+    from epss_fetcher import enrich_cve_list, priority_score as epss_priority  # noqa: F401
+    KEV_AVAILABLE = True
+except ImportError:
+    KEV_AVAILABLE = False
+
 import job_store
 
 BDU_JOBS: dict[str, dict] = {}
@@ -472,6 +487,11 @@ def _quality_check(job_id: str, sbom_path: Path) -> dict:
 
     chk("dependencies (граф зависимостей)", bool(data.get("dependencies")))
 
+    # CISA 2025: Generation Context — formulation section (cdxgen --include-formulation)
+    has_formulation = bool(data.get("formulation"))
+    chk("formulation (CISA 2025 Generation Context)", has_formulation,
+        "cdxgen --include-formulation или --profile appsec")
+
     weights = {
         "bomFormat = CycloneDX": 10,
         "specVersion присутствует": 5,
@@ -487,6 +507,7 @@ def _quality_check(job_id: str, sbom_path: Path) -> dict:
         "serialNumber (UUID)": 3,
         "metadata.component.name": 5,
         "type (library/framework/…)": 3,
+        "formulation (CISA 2025 Generation Context)": 5,
     }
     earned = sum(w for c in checks if c["passed"] for name, w in weights.items() if name == c["name"])
     max_w  = sum(weights.values())
@@ -516,24 +537,26 @@ def _run_cdxgen_multi(job_id: str, project_path: str, langs: list[dict],
 
     raw_out = out_dir / "sbom-cdxgen-raw.json"
 
+    profile = "appsec"  # appsec profile auto-enables --deep + evidence
     extra_flags = list(extra)
-    if has_c:
-        extra_flags += ["--deep"]  # deeper binary analysis for C/C++
-    extra_flags += ["--evidence"]  # include evidence of component identification
-    extra_flags += ["--recurse"]   # explicitly recurse into subdirs
+    extra_flags += ["--include-formulation"]  # CISA 2025: Generation Context
+    extra_flags += ["--recurse"]              # recurse into subdirs
+    # --deep is already enabled by appsec profile for C/C++
+    if has_c and "appsec" not in profile:
+        extra_flags += ["--deep"]
 
     lang_names = ", ".join(f"{l.get('icon','')} {l['name']}" for l in langs)
-    _log(job_id, f"\n  ▸ cdxgen --type {' --type '.join(types)}"
-         + (" --deep" if has_c else "") + " --evidence --recurse")
+    _log(job_id, f"\n  ▸ cdxgen --type {' --type '.join(types)} --profile {profile} --include-formulation")
     _log(job_id, f"    Языки: {lang_names}")
 
     rc = _run(job_id, [
         "cdxgen",
         *type_args,
-        "--spec-version",    spec_ver,
-        "--output",          str(raw_out),
-        "--project-name",    proj_name,
-        "--project-version", proj_ver,
+        "--spec-version",     spec_ver,
+        "--output",           str(raw_out),
+        "--project-name",     proj_name,
+        "--project-version",  proj_ver,
+        "--profile",          profile,
         *filters, *extra_flags,
         project_path,
     ], env={**os.environ})
@@ -1100,13 +1123,33 @@ async def bdu_scan(background_tasks: BackgroundTasks, params: dict = Body(...)):
     def _do_scan():
         try:
             result = scan_sbom(sbom_path, db_path=BDU_DB)
+
+
             BDU_JOBS[task_id]["result"] = result
             BDU_JOBS[task_id]["status"] = "done"
             s = result["stats"]
             BDU_JOBS[task_id]["logs"].append(
                 f"✓ Готово: {s['affected_components']} компонентов с уязвимостями, "
-                f"{s['total_vulns']} всего (critical={s['critical']}, high={s['high']})"
+                f"{s['total_vulns']} всего (critical={s.get('critical',0)}, high={s.get('high',0)})"
             )
+
+            # ── Auto-generate VEX SBOM ────────────────────────────────────
+            if IMPORTERS_OK:
+                try:
+                    vex_out = sbom_path.parent / (sbom_path.stem + "-vex.json")
+                    embed_vex_into_sbom(sbom_path, result, vex_out)
+                    BDU_JOBS[task_id]["vex_file"] = vex_out.name
+                    BDU_JOBS[task_id]["logs"].append(f"  ✓ VEX SBOM сгенерирован: {vex_out.name}")
+                    # Update job output_files if we know the job_id
+                    src_job = params.get("job_id")
+                    if src_job:
+                        jj = job_store.get_job(src_job)
+                        if jj:
+                            files = list(set((jj.get("output_files") or []) + [vex_out.name]))
+                            job_store.update_job(src_job, output_files=files)
+                except Exception as ve:
+                    BDU_JOBS[task_id]["logs"].append(f"  ⚠ VEX: {ve}")
+
         except Exception as e:
             BDU_JOBS[task_id]["status"] = "error"
             BDU_JOBS[task_id]["logs"].append(f"✗ Ошибка: {e}")
@@ -1129,3 +1172,204 @@ async def bdu_search(q: str, limit: int = 10):
         raise HTTPException(409, "База BDU не загружена")
     results = match_component(name=q, limit=limit, db_path=BDU_DB)
     return {"results": results}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# API: BDU scan with VEX + XLSX export
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/bdu/scan/{task_id}/vex")
+async def bdu_generate_vex(task_id: str, params: dict = Body(default={})):
+    """Embed BDU scan results as VEX section into SBOM JSON."""
+    if task_id not in BDU_JOBS:
+        raise HTTPException(404, "Задача не найдена")
+    j = BDU_JOBS[task_id]
+    if j.get("status") != "done" or not j.get("result"):
+        raise HTTPException(409, "Сканирование ещё не завершено")
+    if not IMPORTERS_OK:
+        raise HTTPException(503, "vex_generator недоступен")
+
+    # Find SBOM from job
+    job_id = params.get("job_id")
+    sbom_path: Optional[Path] = None
+    if job_id:
+        jj = job_store.get_job(job_id)
+        if jj and jj.get("final_sbom"):
+            sbom_path = Path(jj["output_dir"]) / jj["final_sbom"]
+    if not sbom_path or not sbom_path.exists():
+        direct = params.get("sbom_path", "")
+        if direct:
+            sbom_path = Path(direct)
+    if not sbom_path or not sbom_path.exists():
+        raise HTTPException(404, "SBOM файл не найден")
+
+    out_path = sbom_path.parent / (sbom_path.stem + "-vex.json")
+    embed_vex_into_sbom(sbom_path, j["result"], out_path)
+
+    # Update job output files
+    if job_id:
+        jj = job_store.get_job(job_id)
+        if jj:
+            files = list(set((jj.get("output_files") or []) + [out_path.name]))
+            job_store.update_job(job_id, output_files=files)
+
+    return {"vex_file": out_path.name, "vulnerabilities_count": len(j["result"].get("components", []))}
+
+
+@app.post("/api/bdu/scan/{task_id}/xlsx")
+async def bdu_export_xlsx(task_id: str, params: dict = Body(default={})):
+    """Export BDU scan results + SBOM stats to XLSX."""
+    if task_id not in BDU_JOBS:
+        raise HTTPException(404, "Задача не найдена")
+    j = BDU_JOBS[task_id]
+    if j.get("status") != "done" or not j.get("result"):
+        raise HTTPException(409, "Сканирование ещё не завершено")
+    if not IMPORTERS_OK:
+        raise HTTPException(503, "xlsx_exporter недоступен")
+
+    job_id = params.get("job_id")
+    sbom_stats = {}
+    out_dir: Optional[Path] = None
+    if job_id:
+        jj = job_store.get_job(job_id)
+        if jj:
+            sbom_stats = jj.get("stats") or {}
+            out_dir = Path(jj["output_dir"])
+    if not out_dir:
+        out_dir = JOBS_DIR / "exports"
+        out_dir.mkdir(exist_ok=True)
+
+    xlsx_path = out_dir / "bdu-report.xlsx"
+    ok = export_bdu_scan(j["result"], sbom_stats, xlsx_path)
+    if not ok:
+        raise HTTPException(500, "openpyxl недоступен, установите: pip install openpyxl")
+
+    if job_id:
+        jj = job_store.get_job(job_id)
+        if jj:
+            files = list(set((jj.get("output_files") or []) + [xlsx_path.name]))
+            job_store.update_job(job_id, output_files=files)
+
+    return FileResponse(xlsx_path, filename="bdu-report.xlsx",
+                        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# API: Import external scanner results (Grype, Trivy, SARIF, OSV)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/import")
+async def import_scanner_results(file: UploadFile = File(...)):
+    """
+    Auto-detect and import vulnerability scanner results.
+    Supports: Grype JSON, Trivy JSON, OSV-Scanner JSON, SARIF 2.1.0, Generic JSON.
+    Returns normalized findings list.
+    """
+    if not IMPORTERS_OK:
+        raise HTTPException(503, "vuln_importer недоступен")
+
+    data = await file.read()
+    if len(data) > 50 * 1024 * 1024:
+        raise HTTPException(413, "Файл слишком большой (макс. 50 МБ)")
+
+    try:
+        fmt, findings = import_vuln_file(data)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    # Deduplicate by fingerprint
+    seen: set[str] = set()
+    unique = []
+    for f in findings:
+        fp = f.get("fingerprint", "")
+        if fp not in seen:
+            seen.add(fp)
+            unique.append(f)
+
+    # Stats
+    stats: dict[str, int] = {}
+    for f in unique:
+        sev = f.get("severity", "unknown")
+        stats[sev] = stats.get(sev, 0) + 1
+
+    return {
+        "format":      fmt,
+        "imported":    len(unique),
+        "duplicates":  len(findings) - len(unique),
+        "stats":       stats,
+        "findings":    unique[:500],  # cap for response size
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# API: Triage — update finding status
+# ═══════════════════════════════════════════════════════════════════════════
+
+# In-memory triage store (keyed by fingerprint)
+_TRIAGE: dict[str, str] = {}
+
+@app.post("/api/triage")
+async def update_triage(params: dict = Body(...)):
+    """
+    Update triage status for a vulnerability finding.
+    Status: open | confirmed | resolved | risk_accepted | false_positive
+    """
+    fingerprint = params.get("fingerprint", "")
+    status = params.get("status", "open")
+    valid = {"open", "confirmed", "resolved", "risk_accepted", "false_positive"}
+    if not fingerprint:
+        raise HTTPException(400, "fingerprint обязателен")
+    if status not in valid:
+        raise HTTPException(400, f"Неверный статус. Допустимые: {', '.join(valid)}")
+    _TRIAGE[fingerprint] = status
+    return {"fingerprint": fingerprint, "status": status}
+
+
+@app.get("/api/triage")
+async def get_triage():
+    """Get all triage statuses."""
+    return {"triage": _TRIAGE, "count": len(_TRIAGE)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# API: Quality score endpoint for existing SBOM file
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/quality")
+async def check_sbom_quality(params: dict = Body(...)):
+    """Run CISA 2025 quality check on an existing SBOM file."""
+    sbom_path = params.get("sbom_path", "")
+    if not sbom_path or not Path(sbom_path).exists():
+        raise HTTPException(404, "SBOM файл не найден")
+
+    # Create temporary job context for logging
+    job_id = f"quality_{uuid.uuid4().hex[:8]}"
+    _LOG_CACHE[job_id] = []
+    quality = _quality_check(job_id, Path(sbom_path))
+    stats = _collect_stats(Path(sbom_path))
+    del _LOG_CACHE[job_id]
+    return {"quality": quality, "stats": stats}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# API: Available scanners/tools status
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/tools")
+async def tools_status():
+    """Return availability of external tools."""
+    import shutil as sh
+    tools = {
+        "cdxgen":       bool(sh.which("cdxgen")),
+        "syft":         bool(sh.which("syft")),
+        "grype":        bool(sh.which("grype")),
+        "trivy":        bool(sh.which("trivy")),
+        "osv-scanner":  bool(sh.which("osv-scanner")),
+        "sbomqs":       bool(sh.which("sbomqs")),
+        "cyclonedx":    bool(sh.which("cyclonedx")),
+        "jq":           bool(sh.which("jq")),
+    }
+    return {"tools": tools, "bdu_available": BDU_AVAILABLE,
+            "importers_ok": IMPORTERS_OK}
+
+
