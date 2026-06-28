@@ -17,20 +17,21 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, B
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-# BDU модули
+# BDU modules
 sys.path.insert(0, str(Path(__file__).parent))
 try:
     from bdu_parser  import build_db, db_exists, get_meta, DB_PATH as BDU_DB
     from bdu_matcher import scan_sbom, get_stats, match_component
     BDU_AVAILABLE = True
-except ImportError as _e:
+except ImportError:
     BDU_AVAILABLE = False
     BDU_DB = Path(__file__).parent / "bdu.db"
 
-# Задания BDU (импорт и сканирование)
+import job_store
+
 BDU_JOBS: dict[str, dict] = {}
 
-# ─── Пути ───────────────────────────────────────────────────────────────────
+# ─── Paths ──────────────────────────────────────────────────────────────────
 BASE_DIR    = Path(__file__).parent
 CHECKER_DIR = BASE_DIR.parent / "sbom-checker-master"
 JOBS_DIR    = BASE_DIR / "jobs"
@@ -42,11 +43,13 @@ UPDATER_PY = CHECKER_DIR / "sbom-updater.py"
 TO_CSV_PY  = CHECKER_DIR / "sbom-to-csv.py"
 TO_ODT_PY  = CHECKER_DIR / "sbom-to-odt.py"
 
-# sbom_utils живёт рядом с checker — добавляем в PYTHONPATH для subprocess
 CHECKER_ENV = {**os.environ, "PYTHONPATH": str(CHECKER_DIR)}
 
-# ─── Хранилище заданий ──────────────────────────────────────────────────────
-JOBS: dict[str, dict] = {}
+# In-memory log cache for running jobs (flushed to SQLite periodically)
+_LOG_CACHE: dict[str, list[str]] = {}
+_LOG_CURSOR: dict[str, int] = {}
+
+job_store.init(BASE_DIR / "jobs.db")
 
 app = FastAPI(title="SBOM Automation")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -109,7 +112,6 @@ async def upload_file(file: UploadFile = File(...)):
     async with aiofiles.open(dest, "wb") as f:
         await f.write(await file.read())
 
-    # Определяем тип по имени файла (не только по последнему расширению)
     extracted = None
     fname = name.lower()
     if fname.endswith(".tar.gz") or fname.endswith(".tgz") or fname.endswith(".tar.bz2") \
@@ -129,7 +131,6 @@ async def upload_file(file: UploadFile = File(...)):
         with gzip.open(dest, "rb") as gz, open(out, "wb") as o:
             shutil.copyfileobj(gz, o)
 
-    # Если архив содержит ровно одну папку — входим в неё
     if extracted:
         children = [c for c in extracted.iterdir() if not c.name.startswith(".")]
         if len(children) == 1 and children[0].is_dir():
@@ -145,10 +146,179 @@ async def upload_file(file: UploadFile = File(...)):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Language Detection
+# ═══════════════════════════════════════════════════════════════════════════
+
+# (cdxgen_type, display_name, icon, root_markers, glob_markers, recursive_glob)
+# root_markers: files to check directly in project root
+# glob_markers: glob patterns to search recursively
+_SKIP_DIRS = {"node_modules", ".git", "vendor", "target", "__pycache__",
+              ".venv", "venv", "build", "dist", ".cache"}
+
+LANGUAGE_SPECS = [
+    {
+        "type": "go",
+        "name": "Go",
+        "icon": "🐹",
+        "root": ["go.mod"],
+        "glob": [],
+    },
+    {
+        "type": "python",
+        "name": "Python",
+        "icon": "🐍",
+        "root": ["requirements.txt", "setup.py", "pyproject.toml", "Pipfile", "setup.cfg", "poetry.lock"],
+        "glob": ["**/requirements*.txt", "**/pyproject.toml"],
+    },
+    {
+        "type": "js",
+        "name": "Node.js",
+        "icon": "🟩",
+        "root": ["package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml"],
+        "glob": [],
+    },
+    {
+        "type": "java",
+        "name": "Java/Maven",
+        "icon": "☕",
+        "root": ["pom.xml"],
+        "glob": ["**/pom.xml"],
+    },
+    {
+        "type": "gradle",
+        "name": "Gradle",
+        "icon": "🐘",
+        "root": ["build.gradle", "build.gradle.kts", "settings.gradle"],
+        "glob": ["**/build.gradle", "**/build.gradle.kts"],
+    },
+    {
+        "type": "rust",
+        "name": "Rust",
+        "icon": "🦀",
+        "root": ["Cargo.toml"],
+        "glob": ["**/Cargo.toml"],
+    },
+    {
+        "type": "dotnet",
+        "name": ".NET",
+        "icon": "🔷",
+        "root": [],
+        "glob": ["**/*.csproj", "**/*.sln", "**/*.fsproj"],
+    },
+    {
+        "type": "php",
+        "name": "PHP",
+        "icon": "🐘",
+        "root": ["composer.json"],
+        "glob": ["**/composer.json"],
+    },
+    {
+        "type": "ruby",
+        "name": "Ruby",
+        "icon": "💎",
+        "root": ["Gemfile"],
+        "glob": ["**/Gemfile"],
+    },
+    {
+        "type": "c",
+        "name": "C/C++",
+        "icon": "⚙️",
+        "root": ["CMakeLists.txt", "conanfile.txt", "conanfile.py", "vcpkg.json", "meson.build", "Makefile"],
+        "glob": ["**/CMakeLists.txt", "**/conanfile.txt", "**/vcpkg.json", "**/meson.build",
+                 "**/*.c", "**/*.cpp", "**/*.h", "**/*.cc", "**/*.cxx"],
+    },
+]
+
+
+def _detect_languages(project_path: str) -> list[dict]:
+    """
+    Scans project directory for language/ecosystem markers.
+    Checks root files first, then recurses into subdirectories.
+    Returns detected ecosystems with cdxgen type and display info.
+    """
+    p = Path(project_path)
+    found: dict[str, dict] = {}
+
+    def _is_skipped(path: Path) -> bool:
+        return any(part in _SKIP_DIRS for part in path.parts)
+
+    for spec in LANGUAGE_SPECS:
+        cdx_type = spec["type"]
+        # 1. Check root markers (fast path)
+        for marker in spec["root"]:
+            if (p / marker).exists():
+                found[cdx_type] = {
+                    "type": cdx_type,
+                    "name": spec["name"],
+                    "icon": spec["icon"],
+                    "marker": marker,
+                }
+                break
+
+        if cdx_type in found:
+            continue
+
+        # 2. Glob search (recursive, limited depth)
+        for pattern in spec["glob"]:
+            for hit in p.glob(pattern):
+                if not _is_skipped(hit.relative_to(p)):
+                    found[cdx_type] = {
+                        "type": cdx_type,
+                        "name": spec["name"],
+                        "icon": spec["icon"],
+                        "marker": str(hit.relative_to(p)),
+                    }
+                    break
+            if cdx_type in found:
+                break
+
+    # gradle is more specific than java — drop java if both detected
+    if "gradle" in found and "java" in found:
+        del found["java"]
+
+    # Fallback: look for raw .c/.cpp files
+    if not found:
+        for ext in ("*.c", "*.cpp", "*.cc", "*.cxx"):
+            hits = [h for h in p.rglob(ext) if not _is_skipped(h.relative_to(p))]
+            if hits:
+                found["c"] = {"type": "c", "name": "C/C++", "icon": "⚙️", "marker": ext}
+                break
+
+    if not found:
+        found["c"] = {"type": "c", "name": "C/C++", "icon": "⚙️", "marker": "(auto)"}
+
+    return list(found.values())
+
+
+@app.get("/api/detect")
+async def detect_languages(path: str):
+    p = Path(path)
+    if not p.is_dir():
+        raise HTTPException(404, "Директория не найдена")
+    langs = _detect_languages(path)
+    return {"path": path, "languages": langs}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Pipeline helpers
 # ═══════════════════════════════════════════════════════════════════════════
+
 def _log(job_id: str, line: str):
-    JOBS[job_id]["logs"].append(line)
+    """Append to in-memory log cache; flush to DB every 50 lines."""
+    if job_id not in _LOG_CACHE:
+        _LOG_CACHE[job_id] = []
+    _LOG_CACHE[job_id].append(line)
+    # Flush to DB every 50 lines or immediately if short line
+    if len(_LOG_CACHE[job_id]) % 50 == 0:
+        _flush_logs(job_id)
+
+
+def _flush_logs(job_id: str):
+    """Write accumulated logs to SQLite."""
+    if job_id in _LOG_CACHE:
+        logs = _LOG_CACHE[job_id]
+        job_store.update_job(job_id, logs=logs)
+
 
 def _run(job_id: str, cmd: list, cwd: str | None = None, env: dict | None = None) -> int:
     _log(job_id, f"\n$ {' '.join(str(c) for c in cmd)}")
@@ -163,7 +333,7 @@ def _run(job_id: str, cmd: list, cwd: str | None = None, env: dict | None = None
 
 
 def _filter_noise(job_id: str, src: Path, dst: Path):
-    """Удаляем системные deb/rpm/apk пакеты через jq."""
+    """Remove system deb/rpm/apk packages via jq."""
     jq_expr = (
         r'def sys: (.purl? // "") | test("^pkg:(deb|rpm|apk)/") or'
         r' ((.name? // "") | test("^(linux-|libc6$|libgcc|libstdc\\+\\+|gcc-[0-9]'
@@ -189,16 +359,52 @@ def _filter_noise(job_id: str, src: Path, dst: Path):
         shutil.copy(src, dst)
 
 
+def _merge_sboms(job_id: str, sbom_files: list[Path], out: Path) -> bool:
+    """Merge multiple CycloneDX JSON SBOMs into one via jq dedup."""
+    if len(sbom_files) == 1:
+        shutil.copy(sbom_files[0], out)
+        return True
+
+    # Try cyclonedx-cli merge first
+    if shutil.which("cyclonedx"):
+        args = []
+        for f in sbom_files:
+            args += ["--input-file", str(f)]
+        rc = _run(job_id, [
+            "cyclonedx", "merge",
+            *args,
+            "--output-file", str(out),
+            "--output-format", "json",
+        ], env={**os.environ})
+        if rc == 0 and out.exists() and out.stat().st_size > 10:
+            _log(job_id, f"  ✓ Слияние через cyclonedx-cli: {len(sbom_files)} файлов")
+            return True
+
+    # Fallback: jq merge with deduplication by purl
+    jq_expr = (
+        r'.[0] as $base | reduce .[1:][] as $other ($base; '
+        r'.components += ($other.components // [])) | '
+        r'.components = ([.components[] | {key: (.purl // (.name + "@" + (.version // ""))), value: .}] '
+        r'| group_by(.key) | map(.[0].value))'
+    )
+    res = subprocess.run(
+        ["jq", "-s", jq_expr] + [str(f) for f in sbom_files],
+        capture_output=True, text=True,
+    )
+    if res.returncode == 0 and res.stdout.strip():
+        out.write_text(res.stdout)
+        _log(job_id, f"  ✓ Слияние через jq: {len(sbom_files)} файлов")
+        return True
+
+    _log(job_id, "  ⚠ Слияние не удалось, использую первый файл")
+    shutil.copy(sbom_files[0], out)
+    return False
+
+
 def _quality_check(job_id: str, sbom_path: Path) -> dict:
-    """
-    Проверка качества SBOM по стандартам:
-    - CISA 2025 Minimum Elements
-    - NTIA Minimum Elements
-    - CycloneDX best practices
-    Возвращает dict с результатами и score 0-100.
-    """
+    """Quality check per CISA 2025 + NTIA minimum elements. Returns score 0-100."""
     _log(job_id, "\n" + "═" * 60)
-    _log(job_id, "▶ ШАГ 5: Проверка качества SBOM (CISA 2025)")
+    _log(job_id, "▶ ШАГ: Проверка качества SBOM (CISA 2025 + NTIA)")
     _log(job_id, "═" * 60)
 
     try:
@@ -218,7 +424,6 @@ def _quality_check(job_id: str, sbom_path: Path) -> dict:
         mark = "✓" if passed else ("✗" if critical else "⚠")
         _log(job_id, f"  {mark} {name}" + (f": {detail}" if detail else ""))
 
-    # ── Документ-уровень ────────────────────────────────────────────────
     chk("bomFormat = CycloneDX",     data.get("bomFormat") == "CycloneDX", critical=True)
     chk("specVersion присутствует",  bool(data.get("specVersion")), critical=True)
     chk("serialNumber (UUID)",        bool(data.get("serialNumber")), "urn:uuid:…")
@@ -226,16 +431,13 @@ def _quality_check(job_id: str, sbom_path: Path) -> dict:
     chk("metadata.timestamp",         bool(meta.get("timestamp")),
         detail=meta.get("timestamp", "ОТСУТСТВУЕТ"), critical=True)
 
-    # CISA 2025: инструмент генерации
     tools = meta.get("tools", {})
     has_tools = bool(tools.get("components") or tools.get("services") or isinstance(tools, list))
     chk("metadata.tools (CISA 2025)", has_tools, "наименование инструмента генерации")
 
-    # CISA 2025: supplier/manufacturer
     mfr = meta.get("manufacture") or meta.get("manufacturer") or meta.get("supplier")
     chk("metadata.manufacture/supplier (CISA 2025)", bool(mfr))
 
-    # metadata.component (описание самого продукта)
     mc = meta.get("component", {})
     chk("metadata.component.name",    bool(mc.get("name")), critical=True)
     chk("metadata.component.version", bool(mc.get("version")))
@@ -246,16 +448,15 @@ def _quality_check(job_id: str, sbom_path: Path) -> dict:
         score = 10 if all(c["passed"] for c in checks if c["critical"]) else 0
         return {"score": score, "checks": checks, "total": 0}
 
-    # ── Покрытие компонентов ─────────────────────────────────────────────
     def pct(lst): return f"{sum(lst)}/{total} ({100*sum(lst)//total}%)"
 
-    has_purl    = [bool(c.get("purl"))    for c in comps]
-    has_ver     = [bool(c.get("version")) for c in comps]
-    has_lic     = [bool(c.get("licenses")) for c in comps]
-    has_hash    = [bool(c.get("hashes"))  for c in comps]
-    has_name    = [bool(c.get("name"))    for c in comps]
-    has_type    = [bool(c.get("type"))    for c in comps]
-    has_refs    = [bool(c.get("externalReferences")) for c in comps]
+    has_purl = [bool(c.get("purl"))    for c in comps]
+    has_ver  = [bool(c.get("version")) for c in comps]
+    has_lic  = [bool(c.get("licenses")) for c in comps]
+    has_hash = [bool(c.get("hashes"))  for c in comps]
+    has_name = [bool(c.get("name"))    for c in comps]
+    has_type = [bool(c.get("type"))    for c in comps]
+    has_refs = [bool(c.get("externalReferences")) for c in comps]
 
     chk("Все компоненты имеют name",    all(has_name),    pct(has_name),    critical=True)
     chk("PURL (NTIA / CISA 2025)",      all(has_purl),    pct(has_purl),    critical=True)
@@ -265,15 +466,12 @@ def _quality_check(job_id: str, sbom_path: Path) -> dict:
     chk("type (library/framework/…)",   all(has_type),    pct(has_type))
     chk("externalReferences (VCS)",     sum(has_refs) > 0, pct(has_refs))
 
-    # Проверка корректности PURL-формата
     bad_purl = [c["purl"] for c in comps if c.get("purl") and not c["purl"].startswith("pkg:")]
     chk("PURL-формат (pkg:…)",          len(bad_purl) == 0,
         f"неверных: {len(bad_purl)}" if bad_purl else "")
 
-    # dependencies секция
     chk("dependencies (граф зависимостей)", bool(data.get("dependencies")))
 
-    # ── Итоговый score ───────────────────────────────────────────────────
     weights = {
         "bomFormat = CycloneDX": 10,
         "specVersion присутствует": 5,
@@ -298,96 +496,258 @@ def _quality_check(job_id: str, sbom_path: Path) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Main Pipeline (runs in thread via BackgroundTasks)
+# Multi-Language SBOM Generation
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _run_cdxgen_multi(job_id: str, project_path: str, langs: list[dict],
+                      out_dir: Path, spec_ver: str, proj_name: str, proj_ver: str,
+                      filters: list, extra: list) -> Optional[Path]:
+    """
+    Run cdxgen ONCE with all detected language types as multiple --type flags.
+    Adds --deep for C/C++ projects, --evidence for richer metadata.
+    Returns output path or None.
+    """
+    types = [l["type"] for l in langs]
+    has_c = "c" in types
+
+    type_args = []
+    for t in types:
+        type_args += ["--type", t]
+
+    raw_out = out_dir / "sbom-cdxgen-raw.json"
+
+    extra_flags = list(extra)
+    if has_c:
+        extra_flags += ["--deep"]  # deeper binary analysis for C/C++
+    extra_flags += ["--evidence"]  # include evidence of component identification
+    extra_flags += ["--recurse"]   # explicitly recurse into subdirs
+
+    lang_names = ", ".join(f"{l.get('icon','')} {l['name']}" for l in langs)
+    _log(job_id, f"\n  ▸ cdxgen --type {' --type '.join(types)}"
+         + (" --deep" if has_c else "") + " --evidence --recurse")
+    _log(job_id, f"    Языки: {lang_names}")
+
+    rc = _run(job_id, [
+        "cdxgen",
+        *type_args,
+        "--spec-version",    spec_ver,
+        "--output",          str(raw_out),
+        "--project-name",    proj_name,
+        "--project-version", proj_ver,
+        *filters, *extra_flags,
+        project_path,
+    ], env={**os.environ})
+
+    if rc != 0:
+        _log(job_id, f"  ⚠ cdxgen завершился с кодом {rc}")
+
+    if raw_out.exists() and raw_out.stat().st_size > 50:
+        try:
+            data = json.loads(raw_out.read_text())
+            cnt = len(data.get("components", []))
+            if cnt > 0 or data.get("metadata", {}).get("component"):
+                # Show breakdown by ecosystem
+                ecosystems: dict[str, int] = {}
+                for c in data.get("components", []):
+                    purl = c.get("purl", "")
+                    if purl and ":" in purl:
+                        eco = purl.split(":")[1].split("/")[0]
+                        ecosystems[eco] = ecosystems.get(eco, 0) + 1
+                eco_str = ", ".join(f"{k}:{v}" for k, v in sorted(ecosystems.items()))
+                _log(job_id, f"  ✓ cdxgen: {cnt} компонентов [{eco_str}]")
+                return raw_out
+        except Exception:
+            pass
+        _log(job_id, "  ⚠ cdxgen SBOM пуст или невалиден")
+
+    return None
+
+
+def _run_cdxgen_auto(job_id: str, project_path: str, out_dir: Path,
+                     spec_ver: str, proj_name: str, proj_ver: str) -> Optional[Path]:
+    """
+    Fallback: run cdxgen without --type (full auto-detection).
+    Used when per-type scan yields nothing.
+    """
+    raw_out = out_dir / "sbom-auto-raw.json"
+    _log(job_id, "\n  ▸ cdxgen [auto-detect без --type]")
+    rc = _run(job_id, [
+        "cdxgen",
+        "--spec-version",    spec_ver,
+        "--output",          str(raw_out),
+        "--project-name",    proj_name,
+        "--project-version", proj_ver,
+        "--evidence",
+        "--recurse",
+        project_path,
+    ], env={**os.environ})
+
+    if rc != 0:
+        _log(job_id, f"  ⚠ cdxgen auto завершился с кодом {rc}")
+
+    if raw_out.exists() and raw_out.stat().st_size > 50:
+        try:
+            data = json.loads(raw_out.read_text())
+            cnt = len(data.get("components", []))
+            if cnt > 0:
+                _log(job_id, f"  ✓ cdxgen auto: {cnt} компонентов")
+                return raw_out
+        except Exception:
+            pass
+
+    return None
+
+
+def _run_syft(job_id: str, project_path: str, out_dir: Path, spec_ver: str,
+              has_conan: bool) -> Optional[Path]:
+    """Run syft for binary/conan analysis. Returns output path or None."""
+    if not shutil.which("syft"):
+        return None
+
+    catalogers = "conan-cataloger,binary-cataloger" if has_conan else "binary-cataloger"
+    raw_out = out_dir / "sbom-syft-raw.json"
+
+    _log(job_id, f"\n  ▸ syft [binary+conan] catalogers={catalogers}")
+    _run(job_id, [
+        "syft", f"dir:{project_path}",
+        "--output",                    f"cyclonedx-json@{spec_ver}={raw_out}",
+        "--override-default-catalogers", catalogers,
+        "--exclude", "/usr/share/**",
+        "--exclude", "/var/**",
+        "--exclude", "/etc/**",
+        "--exclude", "**/.git/**",
+        "--exclude", "**/node_modules/**",
+    ], env={**os.environ})
+
+    if raw_out.exists() and raw_out.stat().st_size > 50:
+        try:
+            data = json.loads(raw_out.read_text())
+            cnt = len(data.get("components", []))
+            if cnt > 0:
+                _log(job_id, f"  ✓ syft: {cnt} компонентов")
+                return raw_out
+        except Exception:
+            pass
+
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main Pipeline
 # ═══════════════════════════════════════════════════════════════════════════
 def _pipeline(job_id: str, params: dict):
-    j = JOBS[job_id]
-    j["status"] = "running"
-    out_dir = Path(j["output_dir"])
+    _LOG_CACHE[job_id] = []
+    job_store.update_job(job_id, status="running")
+    out_dir = Path(job_store.get_job(job_id)["output_dir"])
     mode = params.get("mode", "both")
 
     try:
         generated_sbom: Optional[Path] = None
 
-        # ── ШАГ 1: Генерация ────────────────────────────────────────────
+        # ── STEP 1: Generation ──────────────────────────────────────────────
         if mode in ("generate", "both"):
             _log(job_id, "═" * 60)
-            _log(job_id, "▶ ШАГ 1: Генерация SBOM")
+            _log(job_id, "▶ ШАГ 1: Генерация SBOM (полиглот-режим)")
             _log(job_id, "═" * 60)
 
             project_path = params.get("project_path", "").strip()
             if not project_path or not Path(project_path).exists():
                 _log(job_id, f"✗ Путь не найден: {project_path!r}")
-                j["status"] = "error"
+                _finalize_job(job_id, "error")
                 return
 
             p = Path(project_path)
             spec_ver  = str(params.get("spec_version", "1.6"))
             proj_name = (params.get("project_name") or p.name).strip() or "project"
             proj_ver  = (params.get("project_version") or "0.0.0").strip()
-            scanner   = params.get("scanner", "cdxgen")
-            raw_out   = out_dir / "sbom-raw.json"
+            scanner   = params.get("scanner", "auto")
 
-            if scanner == "cdxgen":
-                filters = []
-                if params.get("filter_deb", True):  filters += ["--filter", "pkg:deb"]
-                if params.get("filter_rpm", True):  filters += ["--filter", "pkg:rpm"]
-                if params.get("filter_apk", True):  filters += ["--filter", "pkg:apk"]
-                extra = ["--required-only"] if params.get("required_only") else []
+            filters = []
+            if params.get("filter_deb", True):  filters += ["--filter", "pkg:deb"]
+            if params.get("filter_rpm", True):  filters += ["--filter", "pkg:rpm"]
+            if params.get("filter_apk", True):  filters += ["--filter", "pkg:apk"]
+            extra = ["--required-only"] if params.get("required_only") else []
 
-                rc = _run(job_id, [
-                    "cdxgen",
-                    "--type",             params.get("project_type", "c"),
-                    "--spec-version",     spec_ver,
-                    "--output",           str(raw_out),
-                    "--project-name",     proj_name,
-                    "--project-version",  proj_ver,
-                    *filters, *extra,
-                    project_path,
-                ], env={**os.environ})
+            raw_sboms: list[Path] = []
 
-                if rc != 0:
-                    _log(job_id, f"⚠  cdxgen завершился с кодом {rc}")
-
-            elif scanner == "syft":
-                has_conan = (p / "conanfile.py").exists() or (p / "conanfile.txt").exists()
-                catalogers = "conan-cataloger,binary-cataloger" if has_conan else "binary-cataloger"
-                _run(job_id, [
-                    "syft", f"dir:{project_path}",
-                    "--output", f"cyclonedx-json@{spec_ver}={raw_out}",
-                    "--override-default-catalogers", catalogers,
-                    "--exclude", "/usr/share/**",
-                    "--exclude", "/var/**", "--exclude", "/etc/**",
-                ], env={**os.environ})
-
-            if raw_out.exists() and raw_out.stat().st_size > 10:
-                generated_sbom = raw_out
-                _log(job_id, "\n▶ Фильтрация системных пакетов...")
-                filtered = out_dir / "sbom-filtered.json"
-                _filter_noise(job_id, raw_out, filtered)
-                if filtered.exists() and filtered.stat().st_size > 10:
-                    generated_sbom = filtered
+            # Auto-detect languages unless user provided explicit override
+            override_types = params.get("project_types")  # list[str] from UI or None
+            if override_types:
+                langs = [{"type": t, "name": t, "icon": ""} for t in override_types]
+                _log(job_id, f"  Языки (вручную): {', '.join(override_types)}")
             else:
-                _log(job_id, "✗ SBOM не создан (файл пуст или отсутствует)")
+                langs = _detect_languages(project_path)
 
-        # ── ШАГ 2: Определяем SBOM для обработки ───────────────────────
+            job_store.update_job(job_id, detected_languages=langs)
+            lang_names = ", ".join(f"{l.get('icon','')} {l['name']}" for l in langs)
+            _log(job_id, f"  Обнаружены экосистемы: {lang_names}")
+
+            # cdxgen: one invocation with all detected types
+            if scanner in ("cdxgen", "auto", "both") and langs:
+                result = _run_cdxgen_multi(
+                    job_id, project_path, langs,
+                    out_dir, spec_ver, proj_name, proj_ver, filters, extra,
+                )
+                if result:
+                    raw_sboms.append(result)
+                else:
+                    # Fallback: auto-detect mode (no --type)
+                    _log(job_id, "  ⚠ Multi-type scan не дал результатов, пробую auto-detect...")
+                    result = _run_cdxgen_auto(
+                        job_id, project_path, out_dir, spec_ver, proj_name, proj_ver,
+                    )
+                    if result:
+                        raw_sboms.append(result)
+
+            # syft for additional binary analysis (C/C++ projects)
+            has_conan = (p / "conanfile.py").exists() or (p / "conanfile.txt").exists()
+            if scanner in ("syft", "auto", "both"):
+                result = _run_syft(job_id, project_path, out_dir, spec_ver, has_conan)
+                if result:
+                    raw_sboms.append(result)
+
+            if not raw_sboms:
+                _log(job_id, "✗ SBOM не создан — ни один сканер не вернул результат")
+            else:
+                # Filter noise from each SBOM
+                _log(job_id, "\n▶ Фильтрация системных пакетов...")
+                filtered: list[Path] = []
+                for raw in raw_sboms:
+                    dst = raw.parent / raw.name.replace("-raw.json", "-filtered.json")
+                    _filter_noise(job_id, raw, dst)
+                    if dst.exists() and dst.stat().st_size > 10:
+                        filtered.append(dst)
+
+                if not filtered:
+                    filtered = raw_sboms
+
+                # Merge if multiple
+                if len(filtered) > 1:
+                    _log(job_id, f"\n▶ Слияние {len(filtered)} SBOM-файлов...")
+                    merged = out_dir / "sbom-merged.json"
+                    _merge_sboms(job_id, filtered, merged)
+                    generated_sbom = merged
+                else:
+                    generated_sbom = filtered[0]
+
+        # ── STEP 2: Determine input SBOM ────────────────────────────────────
         sbom_in: Optional[Path] = None
         if mode == "validate":
             inp = params.get("input_sbom", "").strip()
             sbom_in = Path(inp) if inp and Path(inp).exists() else None
             if not sbom_in:
                 _log(job_id, "✗ Файл для валидации не найден")
-                j["status"] = "error"
+                _finalize_job(job_id, "error")
                 return
         else:
             sbom_in = generated_sbom
 
         if not sbom_in:
             _log(job_id, "✗ Нет SBOM-файла для обработки")
-            j["status"] = "error"
+            _finalize_job(job_id, "error")
             return
 
-        # ── ШАГ 3: sbom-updater (обогащение) ────────────────────────────
+        # ── STEP 3: sbom-updater enrichment ─────────────────────────────────
         enriched: Optional[Path] = None
         if params.get("run_updater", True):
             _log(job_id, "\n" + "═" * 60)
@@ -411,7 +771,7 @@ def _pipeline(job_id: str, params: dict):
             if params.get("verbose"):       cmd.append("-v")
 
             cmd += [str(sbom_in), str(enriched_out)]
-            rc = _run(job_id, cmd, cwd=str(CHECKER_DIR))
+            _run(job_id, cmd, cwd=str(CHECKER_DIR))
             if enriched_out.exists() and enriched_out.stat().st_size > 10:
                 enriched = enriched_out
                 _log(job_id, f"✓ Обогащение выполнено → {enriched_out.name}")
@@ -421,7 +781,7 @@ def _pipeline(job_id: str, params: dict):
 
         final_sbom = enriched or sbom_in
 
-        # ── ШАГ 4: sbom-checker (валидация схемы) ───────────────────────
+        # ── STEP 4: sbom-checker validation ─────────────────────────────────
         checker_passed = None
         if params.get("run_checker", True):
             _log(job_id, "\n" + "═" * 60)
@@ -445,10 +805,10 @@ def _pipeline(job_id: str, params: dict):
             _log(job_id, ("✓ sbom-checker: PASSED" if checker_passed
                           else f"⚠  sbom-checker: проблемы найдены (код {rc})"))
 
-        # ── ШАГ 5: CISA 2025 quality check ──────────────────────────────
+        # ── STEP 5: CISA 2025 quality check ─────────────────────────────────
         quality = _quality_check(job_id, final_sbom)
 
-        # ── ШАГ 6: Экспорт CSV + ODT ────────────────────────────────────
+        # ── STEP 6: Export CSV + ODT ─────────────────────────────────────────
         _log(job_id, "\n" + "═" * 60)
         _log(job_id, "▶ ШАГ 4: Экспорт (CSV, ODT)")
         _log(job_id, "═" * 60)
@@ -458,37 +818,40 @@ def _pipeline(job_id: str, params: dict):
              cwd=str(CHECKER_DIR))
         if csv_out.exists(): _log(job_id, f"✓ CSV: {csv_out.name}")
 
-        # odt_format: убираем "2025" суффикс, получаем "oss" или "container"
         checker_format = params.get("checker_format", "oss")
-        odt_format = checker_format.replace("2025", "")
-        if not odt_format:
-            odt_format = "oss"
-
+        odt_format = checker_format.replace("2025", "") or "oss"
         odt_out = out_dir / "sbom.odt"
         _run(job_id, [PYTHON, str(TO_ODT_PY), "--format", odt_format,
                       str(final_sbom), str(odt_out)], cwd=str(CHECKER_DIR))
         if odt_out.exists(): _log(job_id, f"✓ ODT: {odt_out.name}")
 
-        # ── Сбор статистики ──────────────────────────────────────────────
+        # ── Collect stats ─────────────────────────────────────────────────────
         stats = _collect_stats(final_sbom)
+        output_files = [f.name for f in out_dir.iterdir() if f.is_file()]
 
-        j.update({
-            "status":        "done",
-            "stats":         stats,
-            "quality":       quality,
-            "output_files":  [f.name for f in out_dir.iterdir() if f.is_file()],
-            "checker_passed": checker_passed,
-            "final_sbom":    final_sbom.name,
-        })
         _log(job_id, "\n" + "═" * 60)
         _log(job_id, "✓ Pipeline завершён успешно")
         _log(job_id, "═" * 60)
 
+        job_store.update_job(job_id,
+            stats=stats,
+            quality=quality,
+            output_files=output_files,
+            checker_passed=1 if checker_passed else (0 if checker_passed is False else None),
+            final_sbom=final_sbom.name,
+        )
+        _finalize_job(job_id, "done")
+
     except Exception as exc:
-        j["status"] = "error"
         _log(job_id, f"\n✗ КРИТИЧЕСКАЯ ОШИБКА: {exc}")
         import traceback
         _log(job_id, traceback.format_exc())
+        _finalize_job(job_id, "error")
+
+
+def _finalize_job(job_id: str, status: str):
+    _flush_logs(job_id)
+    job_store.update_job(job_id, status=status)
 
 
 def _collect_stats(sbom_path: Path) -> dict:
@@ -496,6 +859,14 @@ def _collect_stats(sbom_path: Path) -> dict:
         with open(sbom_path, encoding="utf-8") as f:
             data = json.load(f)
         comps = data.get("components", [])
+
+        ecosystems: dict[str, int] = {}
+        for c in comps:
+            purl = c.get("purl", "")
+            if purl and ":" in purl:
+                eco = purl.split(":")[1].split("/")[0]
+                ecosystems[eco] = ecosystems.get(eco, 0) + 1
+
         return {
             "total":        len(comps),
             "with_purl":    sum(1 for c in comps if c.get("purl")),
@@ -504,15 +875,16 @@ def _collect_stats(sbom_path: Path) -> dict:
             "with_hash":    sum(1 for c in comps if c.get("hashes")),
             "with_refs":    sum(1 for c in comps if c.get("externalReferences")),
             "spec_version": data.get("specVersion", "?"),
+            "ecosystems":   ecosystems,
             "components": [
                 {
-                    "name":     c.get("name", ""),
-                    "version":  c.get("version", ""),
-                    "purl":     c.get("purl", ""),
-                    "type":     c.get("type", ""),
-                    "licenses": ", ".join(
-                        l.get("license", {}).get("id") or l.get("license", {}).get("name", "")
-                        for l in (c.get("licenses") or []) if isinstance(l, dict)
+                    "name":      c.get("name", ""),
+                    "version":   c.get("version", ""),
+                    "purl":      c.get("purl", ""),
+                    "type":      c.get("type", ""),
+                    "licenses":  ", ".join(
+                        ll.get("license", {}).get("id") or ll.get("license", {}).get("name", "")
+                        for ll in (c.get("licenses") or []) if isinstance(ll, dict)
                     ),
                 }
                 for c in comps[:500]
@@ -523,7 +895,7 @@ def _collect_stats(sbom_path: Path) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# API: запуск задания
+# API: run job
 # ═══════════════════════════════════════════════════════════════════════════
 @app.post("/api/run")
 async def run_job(background_tasks: BackgroundTasks, params: dict = Body(...)):
@@ -531,19 +903,7 @@ async def run_job(background_tasks: BackgroundTasks, params: dict = Body(...)):
     out_dir = JOBS_DIR / job_id
     out_dir.mkdir()
 
-    JOBS[job_id] = {
-        "id":            job_id,
-        "status":        "pending",
-        "logs":          [],
-        "output_dir":    str(out_dir),
-        "stats":         {},
-        "quality":       {},
-        "output_files":  [],
-        "checker_passed": None,
-        "final_sbom":    None,
-        "created_at":    time.time(),
-        "params":        params,
-    }
+    job_store.create_job(job_id, str(out_dir), params)
     background_tasks.add_task(_pipeline, job_id, params)
     return {"job_id": job_id}
 
@@ -553,17 +913,23 @@ async def run_job(background_tasks: BackgroundTasks, params: dict = Body(...)):
 # ═══════════════════════════════════════════════════════════════════════════
 @app.get("/api/stream/{job_id}")
 async def stream_logs(job_id: str):
-    if job_id not in JOBS:
+    if not job_store.get_job(job_id):
         raise HTTPException(404)
 
     async def gen():
         sent = 0
         while True:
-            j = JOBS.get(job_id, {})
-            logs = j.get("logs", [])
+            # Prefer in-memory cache (faster for running jobs)
+            if job_id in _LOG_CACHE:
+                logs = _LOG_CACHE[job_id]
+            else:
+                logs = job_store.get_logs(job_id)
+
             while sent < len(logs):
                 yield f"data: {json.dumps(logs[sent])}\n\n"
                 sent += 1
+
+            j = job_store.get_job(job_id) or {}
             if j.get("status") in ("done", "error") and sent >= len(logs):
                 yield "data: __DONE__\n\n"
                 break
@@ -574,33 +940,34 @@ async def stream_logs(job_id: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# API: статус задания
+# API: job status
 # ═══════════════════════════════════════════════════════════════════════════
 @app.get("/api/job/{job_id}")
 async def get_job(job_id: str):
-    if job_id not in JOBS:
+    j = job_store.get_job(job_id)
+    if not j:
         raise HTTPException(404)
-    j = JOBS[job_id]
     return {
-        "id":             j["id"],
-        "status":         j["status"],
-        "stats":          j["stats"],
-        "quality":        j["quality"],
-        "output_files":   j["output_files"],
-        "checker_passed": j["checker_passed"],
-        "final_sbom":     j["final_sbom"],
+        "id":                  j["id"],
+        "status":              j["status"],
+        "stats":               j.get("stats") or {},
+        "quality":             j.get("quality") or {},
+        "output_files":        j.get("output_files") or [],
+        "checker_passed":      bool(j["checker_passed"]) if j["checker_passed"] is not None else None,
+        "final_sbom":          j["final_sbom"],
+        "detected_languages":  j.get("detected_languages") or [],
     }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# API: скачать файл
+# API: download file
 # ═══════════════════════════════════════════════════════════════════════════
 @app.get("/api/download/{job_id}/{filename}")
 async def download_file(job_id: str, filename: str):
-    if job_id not in JOBS:
+    j = job_store.get_job(job_id)
+    if not j:
         raise HTTPException(404)
-    # path traversal guard
-    path = (Path(JOBS[job_id]["output_dir"]) / filename).resolve()
+    path = (Path(j["output_dir"]) / filename).resolve()
     if not str(path).startswith(str(JOBS_DIR)):
         raise HTTPException(403)
     if not path.is_file():
@@ -609,18 +976,23 @@ async def download_file(job_id: str, filename: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# API: история заданий
+# API: job history
 # ═══════════════════════════════════════════════════════════════════════════
 @app.get("/api/jobs")
 async def list_jobs():
-    return sorted(
-        [{"id": j["id"], "status": j["status"],
-          "created_at": j["created_at"],
-          "project": j["params"].get("project_name") or j["params"].get("app_name", "?"),
-          "quality_score": j.get("quality", {}).get("score")}
-         for j in JOBS.values()],
-        key=lambda x: x["created_at"], reverse=True
-    )
+    jobs = job_store.list_jobs(200)
+    return [
+        {
+            "id": j["id"],
+            "status": j["status"],
+            "created_at": j["created_at"],
+            "project": (j.get("params") or {}).get("project_name")
+                       or (j.get("params") or {}).get("app_name", "?"),
+            "quality_score": (j.get("quality") or {}).get("score"),
+            "detected_languages": j.get("detected_languages") or [],
+        }
+        for j in jobs
+    ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -628,7 +1000,6 @@ async def list_jobs():
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _bdu_import_task(task_id: str, zip_path: str):
-    """Фоновый импорт BDU XML в SQLite."""
     BDU_JOBS[task_id]["status"] = "running"
     BDU_JOBS[task_id]["logs"] = []
 
@@ -651,7 +1022,6 @@ def _bdu_import_task(task_id: str, zip_path: str):
 
 @app.get("/api/bdu/status")
 async def bdu_status():
-    """Статус базы данных BDU."""
     if not BDU_AVAILABLE:
         return {"available": False, "error": "bdu_parser модуль недоступен"}
     stats = get_stats(BDU_DB)
@@ -662,7 +1032,6 @@ async def bdu_status():
 
 @app.post("/api/bdu/import")
 async def bdu_import(background_tasks: BackgroundTasks, params: dict = Body(...)):
-    """Запускает импорт BDU XML/ZIP в SQLite."""
     if not BDU_AVAILABLE:
         raise HTTPException(503, "bdu_parser недоступен")
     zip_path = params.get("zip_path", "/root/sbomsauto/vulxml.zip")
@@ -681,7 +1050,6 @@ async def bdu_import(background_tasks: BackgroundTasks, params: dict = Body(...)
 
 @app.get("/api/bdu/import/{task_id}/stream")
 async def bdu_import_stream(task_id: str):
-    """SSE-стрим прогресса импорта BDU."""
     if task_id not in BDU_JOBS:
         raise HTTPException(404)
 
@@ -704,19 +1072,17 @@ async def bdu_import_stream(task_id: str):
 
 @app.post("/api/bdu/scan")
 async def bdu_scan(background_tasks: BackgroundTasks, params: dict = Body(...)):
-    """Сканирует SBOM-файл против базы BDU."""
     if not BDU_AVAILABLE:
         raise HTTPException(503, "bdu_matcher недоступен")
     if not db_exists(BDU_DB):
         raise HTTPException(409, "База BDU не загружена. Сначала выполните импорт.")
 
-    # Получаем SBOM файл — либо из job, либо прямой путь
     sbom_path: Optional[Path] = None
     job_id = params.get("job_id")
-    if job_id and job_id in JOBS:
-        final_sbom = JOBS[job_id].get("final_sbom")
-        if final_sbom:
-            sbom_path = Path(JOBS[job_id]["output_dir"]) / final_sbom
+    if job_id:
+        j = job_store.get_job(job_id)
+        if j and j.get("final_sbom"):
+            sbom_path = Path(j["output_dir"]) / j["final_sbom"]
     if not sbom_path:
         direct = params.get("sbom_path", "")
         if direct:
@@ -751,7 +1117,6 @@ async def bdu_scan(background_tasks: BackgroundTasks, params: dict = Body(...)):
 
 @app.get("/api/bdu/scan/{task_id}")
 async def bdu_scan_result(task_id: str):
-    """Возвращает результат BDU-сканирования."""
     if task_id not in BDU_JOBS:
         raise HTTPException(404)
     j = BDU_JOBS[task_id]
@@ -760,7 +1125,6 @@ async def bdu_scan_result(task_id: str):
 
 @app.get("/api/bdu/search")
 async def bdu_search(q: str, limit: int = 10):
-    """Поиск уязвимостей по имени компонента."""
     if not BDU_AVAILABLE or not db_exists(BDU_DB):
         raise HTTPException(409, "База BDU не загружена")
     results = match_component(name=q, limit=limit, db_path=BDU_DB)
