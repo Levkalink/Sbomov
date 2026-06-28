@@ -213,7 +213,10 @@ def build_db(xml_source: str | Path, db_path: Path = DB_PATH,
 
             if len(vul_rows) >= BATCH:
                 _flush(con, vul_rows, cve_rows, cwe_rows, soft_rows)
-                vul_rows = cve_rows = cwe_rows = soft_rows = []
+                vul_rows  = []
+                cve_rows  = []
+                cwe_rows  = []
+                soft_rows = []
                 if progress_cb:
                     progress_cb(count)
 
